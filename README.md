@@ -68,4 +68,4 @@ Input Dir → Calibrated/image_CAL.fits → Calibrated/image_CAL_WCS.fits
 
 ## License
 
-© Art Trail 2026. All rights reserved.
+MIT License — © Art Trail 2026. See [LICENSE](LICENSE) for details.
