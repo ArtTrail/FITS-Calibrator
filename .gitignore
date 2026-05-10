@@ -1,0 +1,6 @@
+build/
+dist/
+__pycache__/
+*.pyc
+fits_calibrator_Log.log
+fits_calibrator_settings.json
