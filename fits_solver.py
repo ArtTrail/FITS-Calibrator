@@ -24,9 +24,9 @@ import sys
 import time
 import os
 import json
-import shutil
 import subprocess
 import threading
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta
@@ -45,8 +45,17 @@ try:
 except ImportError:
     _CCDPROC_OK = False
 
-VERSION = "2.2.0"
-BUILD   = "20260328"
+VERSION = "2.2.2"
+BUILD   = "20260829"
+
+GITHUB_URL = "https://github.com/ArtTrail/FITS-Calibrator"
+ASTAP_DOWNLOAD_URL = "https://www.hnsky.org/astap.htm"
+ASTAP_CANDIDATE_PATHS = [
+    r"C:\Program Files\astap\astap.exe",
+    r"C:\Program Files (x86)\astap\astap.exe",
+]
+# Extensions vary by catalog type (.1, .290, .360, etc.) — match by filename prefix instead.
+ASTAP_CATALOG_PREFIXES = ["h17", "h18", "h19", "w08", "d05", "d80", "g17", "m17", "v17"]
 
 # ── Color palette (dark theme — matches EXOTIC Launcher) ──────────────────────
 C_BG      = "#2e3440"   # main window background
@@ -61,6 +70,7 @@ C_SEP     = "#4c566a"   # separator / section bar
 C_WARN    = "#ebcb8b"   # warning text (amber)
 C_OK      = "#a3be8c"   # success text (green)
 C_ERR     = "#bf616a"   # error text (red)
+C_LINK    = "#b48ead"   # hyperlink text (Nord purple)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -334,45 +344,28 @@ def calibrate_file(filepath: Path, output_dir: Path,
     logger.success(f"Calibrated → {out_name}")
     return out_path
 
-def platesolve_file(filepath: Path, output_dir: Path,
-                    solver_exe: str, search_radius: float,
-                    logger) -> bool:
-    cal_dir = output_dir / "Calibrated"
-    cal_dir.mkdir(parents=True, exist_ok=True)
-
-    if filepath.parent.resolve() == cal_dir.resolve():
-        work_path = filepath
-        stem      = filepath.stem
-        out_name  = stem + "_WCS.fits"
-        out_path  = cal_dir / out_name
-    else:
-        stem     = filepath.stem
-        out_name = stem + "_WCS.fits"
-        out_path = cal_dir / out_name
-        try:
-            shutil.copy2(str(filepath), str(out_path))
-        except Exception as e:
-            logger.error(f"Cannot copy {filepath.name} for platesolving: {e}")
-            return False
-        work_path = out_path
-
-    cmd = [solver_exe, "-f", str(work_path),
-           "-r", str(search_radius), "-update"]
+def _run_astap_solve(solver_exe: str, work_path: Path, radius: float,
+                     blind: bool, logger) -> tuple[bool, str]:
+    """Run ASTAP once against work_path. Returns (solved, stderr)."""
+    cmd = [solver_exe, "-f", str(work_path), "-r", str(radius), "-update"]
+    if blind:
+        cmd += ["-fov", "0"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        stderr = result.stderr
     except FileNotFoundError:
         logger.error(f"Solver not found: {solver_exe}")
-        return False
+        return False, ""
     except subprocess.TimeoutExpired:
         logger.error(f"Solver timed out on {work_path.name}")
-        return False
+        return False, ""
     except Exception as e:
         logger.error(f"Solver error on {work_path.name}: {e}")
-        return False
+        return False, ""
 
     ini_path = work_path.with_suffix(".ini")
     wcs_path = work_path.with_suffix(".wcs")
-    solved   = False
+    solved = False
     if ini_path.exists():
         try:
             content = ini_path.read_text(encoding="utf-8", errors="replace")
@@ -388,13 +381,51 @@ def platesolve_file(filepath: Path, output_dir: Path,
             wcs_path.unlink()
         except Exception:
             pass
+    return solved, stderr
+
+def _sync_radec_to_solution(work_path: Path, logger):
+    """After a successful solve, overwrite the RA/DEC header keys with the
+    solved field-center (CRVAL1/CRVAL2). ASTAP's -update only adds WCS
+    keywords (CRVAL/CD/CRPIX/CTYPE) — it never touches RA/DEC, so a stale or
+    inaccurate mount-reported RA/DEC otherwise survives a successful solve
+    unchanged."""
+    try:
+        with astropy_fits.open(str(work_path), mode="update") as hdul:
+            hdr = hdul[0].header
+            crval1 = hdr.get("CRVAL1")
+            crval2 = hdr.get("CRVAL2")
+            if crval1 is not None and crval2 is not None:
+                hdr["RA"]  = crval1
+                hdr["DEC"] = crval2
+                hdul.flush()
+    except Exception as e:
+        logger.warn(f"Could not sync RA/DEC header to solved position for {work_path.name}: {e}")
+
+def platesolve_file(filepath: Path,
+                    solver_exe: str, search_radius: float,
+                    logger, blind_retry: bool = True) -> bool:
+    """Plate-solve filepath in place via ASTAP -update. No copy is made —
+    the input file (whatever it is: a raw light frame if calibration is
+    off, or the _CAL.fits output if calibration produced one) is the file
+    that ends up solved."""
+    work_path = filepath
+
+    solved, stderr = _run_astap_solve(solver_exe, work_path, search_radius,
+                                      blind=False, logger=logger)
+
+    if not solved and blind_retry:
+        logger.detail(f"  Directed solve (r={search_radius}°) failed for {work_path.name} — "
+                      f"retrying with a full blind search …")
+        solved, stderr = _run_astap_solve(solver_exe, work_path, 180,
+                                          blind=True, logger=logger)
 
     if solved:
+        _sync_radec_to_solution(work_path, logger)
         logger.success(f"Platesolved → {work_path.name}")
     else:
         logger.warn(f"Platesolve FAILED for {work_path.name}")
-        if result.stderr:
-            logger.detail(f"  stderr: {result.stderr[:200]}")
+        if stderr:
+            logger.detail(f"  stderr: {stderr[:200]}")
 
     return solved
 
@@ -521,6 +552,7 @@ class FITSWatcher(FileSystemEventHandler):
                  solver_exe: str, search_radius: float,
                  logger,
                  platesolve_enabled: bool = True,
+                 blind_retry: bool = True,
                  cal_enabled: bool = False,
                  darks_dir: Path | None = None,
                  flats_dir: Path | None = None,
@@ -534,6 +566,7 @@ class FITSWatcher(FileSystemEventHandler):
         self.output_dir         = output_dir
         self.solver_exe         = solver_exe
         self.search_radius      = search_radius
+        self.blind_retry        = blind_retry
         self.logger             = logger
         self.platesolve_enabled = platesolve_enabled
         self.cal_enabled        = cal_enabled
@@ -661,9 +694,9 @@ class FITSWatcher(FileSystemEventHandler):
                 if self.status_updater:
                     self.status_updater("⚙  Processing ...", C_ACCENT)
                 ok = platesolve_file(
-                    solve_src, self.output_dir,
+                    solve_src,
                     self.solver_exe, self.search_radius,
-                    self.logger)
+                    self.logger, blind_retry=self.blind_retry)
                 with threading.Lock():
                     if ok:
                         self._ps_solved += 1
@@ -685,37 +718,9 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root     = root
         self.root.title(f"FITS Calibrator  v{VERSION} · build {BUILD}")
-        self.root.geometry("1360x1570")
+        self.root.geometry("1020x942")
         self.root.resizable(True, True)
         self.root.configure(bg=C_BG)
-
-        # ── Scrollable canvas ─────────────────────────────────────────────────
-        _vsb    = ttk.Scrollbar(root, orient="vertical")
-        _canvas = tk.Canvas(root, highlightthickness=0, bg=C_BG,
-                            yscrollcommand=_vsb.set)
-        _vsb.config(command=_canvas.yview)
-        _vsb.pack(side="right", fill="y")
-        _canvas.pack(side="left", fill="both", expand=True)
-
-        self._scroll_frame = tk.Frame(_canvas, bg=C_BG)
-        _cw = _canvas.create_window((0, 0), window=self._scroll_frame, anchor="nw")
-
-        def _on_frame_resize(event):
-            _canvas.configure(scrollregion=_canvas.bbox("all"))
-        self._scroll_frame.bind("<Configure>", _on_frame_resize)
-
-        def _on_canvas_resize(event):
-            _canvas.itemconfig(_cw, width=event.width)
-        _canvas.bind("<Configure>", _on_canvas_resize)
-
-        def _on_mousewheel(event):
-            if not isinstance(event.widget, (tk.Text, tk.Listbox)):
-                _canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        self.root.bind_all("<MouseWheel>", _on_mousewheel)
-
-        # Rebind local 'root' so all widget-creation code below targets the
-        # scroll frame automatically.
-        root = self._scroll_frame
 
         self.observer              = None
         self.watcher               = None
@@ -728,20 +733,26 @@ class App:
         s   = load_settings()
         pad = {"padx": 10, "pady": 4}
 
-        # ── Header ───────────────────────────────────────────────────────────
-        header = tk.Frame(root, bg=C_BG2, pady=9)
-        header.grid(row=0, column=0, columnspan=3, sticky="ew")
+        # ── Menu bar ─────────────────────────────────────────────────────────
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="User Guide", command=self._show_instructions)
+        help_menu.add_command(label="Revision History", command=self._show_revision_history)
+        help_menu.add_separator()
+        help_menu.add_command(label="About FITS Calibrator…", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.root.config(menu=menubar)
+
+        # ── Header (fixed, above tabs) ────────────────────────────────────────
+        header = tk.Frame(self.root, bg=C_BG2, pady=9)
+        header.pack(side="top", fill="x")
         tk.Label(header, text="FITS Calibrator",
                  font=("Arial", 14, "bold"), bg=C_BG2, fg=C_FG).pack(side="left", padx=14)
-        tk.Button(header, text="User Guide", font=("", 11),
-                  bg=C_BTN, fg=C_FG, activebackground=C_BTN_ACT,
-                  activeforeground=C_FG, relief="flat", padx=6, pady=2,
-                  command=self._show_instructions).pack(side="right", padx=14)
 
-        # ── Mode toggle bar ───────────────────────────────────────────────────
+        # ── Mode toggle bar (fixed, above tabs) ───────────────────────────────
         self._app_mode = s.get("app_mode", "science")
-        mode_bar = tk.Frame(root, bg=C_BG2, pady=4)
-        mode_bar.grid(row=1, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 2))
+        mode_bar = tk.Frame(self.root, bg=C_BG2, pady=4)
+        mode_bar.pack(side="top", fill="x", padx=6, pady=(0, 2))
         self._mode_btn_science = tk.Button(
             mode_bar, text="Calibrate Science Frames",
             font=("", 11, "bold"), relief="flat", padx=10, pady=3,
@@ -753,14 +764,51 @@ class App:
             command=lambda: self._on_mode_change("master"))
         self._mode_btn_master.pack(side="left", padx=(2, 8), pady=4)
 
+        # ── Notebook: Data / Control tabs ─────────────────────────────────────
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("FC.TNotebook", background=C_BG, borderwidth=0)
+        style.configure("FC.TNotebook.Tab", background=C_SEP, foreground=C_FG,
+                        padding=(16, 6), font=("", 11, "bold"))
+        style.map("FC.TNotebook.Tab",
+                  background=[("selected", C_ACCENT)],
+                  foreground=[("selected", C_BG)])
+
+        self.notebook = ttk.Notebook(self.root, style="FC.TNotebook")
+        self.notebook.pack(side="top", fill="both", expand=True)
+
+        data_tab    = tk.Frame(self.notebook, bg=C_BG)
+        control_tab = tk.Frame(self.notebook, bg=C_BG)
+        self.notebook.add(data_tab,    text="Data")
+        self.notebook.add(control_tab, text="Control")
+
+        data_root, data_canvas       = self._make_scrollable(data_tab)
+        control_root, control_canvas = self._make_scrollable(control_tab)
+        self._tab_canvases = [data_canvas, control_canvas]
+
+        def _on_mousewheel(event):
+            if isinstance(event.widget, (tk.Text, tk.Listbox)):
+                return
+            idx = self.notebook.index(self.notebook.select())
+            self._tab_canvases[idx].yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.root.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # DATA TAB — Directories + Calibration
+        # ═══════════════════════════════════════════════════════════════════
+        root = data_root
+
         # ── Directories ──────────────────────────────────────────────────────
-        self._section(root, "Directories", row=2)
+        self._section(root, "Directories", row=0)
 
         self._input_dir_label = tk.Label(root, text="Input Directory:", bg=C_BG, fg=C_FG)
-        self._input_dir_label.grid(row=3, column=0, sticky="w", **pad)
+        self._input_dir_label.grid(row=1, column=0, sticky="w", **pad)
         _watch_default = s.get("watch_dir", "")
         self.watch_var = tk.StringVar(value=_watch_default)
-        wf = tk.Frame(root, bg=C_BG); wf.grid(row=3, column=1, columnspan=2, padx=5, sticky="ew")
+        wf = tk.Frame(root, bg=C_BG); wf.grid(row=1, column=1, columnspan=2, padx=5, sticky="ew")
         wf.columnconfigure(0, weight=1)
         tk.Entry(wf, textvariable=self.watch_var,
                  bg=C_FIELD, fg=C_FG, insertbackground=C_FG,
@@ -770,10 +818,10 @@ class App:
                   command=self._browse_watch).grid(row=0, column=1, padx=4)
 
         tk.Label(root, text="Output Directory:", bg=C_BG, fg=C_FG).grid(
-            row=4, column=0, sticky="w", padx=10, pady=(14, 4))
+            row=2, column=0, sticky="w", padx=10, pady=(14, 4))
         self.output_var = tk.StringVar(value=s.get("output_dir", _watch_default))
         of = tk.Frame(root, bg=C_BG)
-        of.grid(row=4, column=1, columnspan=2, padx=5, pady=(14, 4), sticky="ew")
+        of.grid(row=2, column=1, columnspan=2, padx=5, pady=(14, 4), sticky="ew")
         of.columnconfigure(0, weight=1)
         tk.Entry(of, textvariable=self.output_var,
                  bg=C_FIELD, fg=C_FG, insertbackground=C_FG,
@@ -783,11 +831,11 @@ class App:
                   command=self._browse_output).grid(row=0, column=1, padx=4)
 
         # ── Calibration ───────────────────────────────────────────────────────
-        self._cal_section_label = self._section(root, "Calibration", row=5)
+        self._cal_section_label = self._section(root, "Calibration", row=3)
 
         # Science mode: Enable toggle + Darks/Flats/Bias rows
         self._cal_toggle_row = tk.Frame(root, bg=C_BG)
-        self._cal_toggle_row.grid(row=6, column=0, columnspan=3, sticky="w", padx=12, pady=(6, 2))
+        self._cal_toggle_row.grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(6, 2))
 
         # Line 1: Enable Calibration
         _cal_line1 = tk.Frame(self._cal_toggle_row, bg=C_BG)
@@ -799,9 +847,17 @@ class App:
         tk.Label(_cal_line1,
                  text="(A 'Calibrated' subdirectory will be created automatically)",
                  fg=C_HINT, font=("", 11), bg=C_BG).pack(side="left", padx=(0, 10))
-        tk.Label(_cal_line1,
+
+        # Line 1b: Algorithm note on its own line (was packed onto Line 1 with the
+        # text above, whose combined width overflowed the window at narrower sizes
+        # and got clipped instead of wrapping — tk.Label doesn't auto-wrap when
+        # packed side="left" in a row).
+        _cal_line1b = tk.Frame(self._cal_toggle_row, bg=C_BG)
+        _cal_line1b.pack(side="top", anchor="w", pady=(0, 4))
+        tk.Label(_cal_line1b, text="", width=3, bg=C_BG).pack(side="left")  # indent
+        tk.Label(_cal_line1b,
                  text="•  Algorithm: bias subtract → dark subtract (exposure-scaled) → flat correct",
-                 fg=C_HINT, font=("", 11), bg=C_BG).pack(side="left", padx=(0, 10))
+                 fg=C_HINT, font=("", 11), bg=C_BG).pack(side="left")
 
         # Line 2: Raw / Master source toggle (indented to align with line 1 text)
         _cal_line2 = tk.Frame(self._cal_toggle_row, bg=C_BG)
@@ -832,7 +888,7 @@ class App:
         self._bias_master_val  = s.get("bias_master_file", "")
 
         self._darks_row = tk.Frame(root, bg=C_BG)
-        self._darks_row.grid(row=7, column=0, columnspan=3, sticky="ew", padx=20, pady=(8, 2))
+        self._darks_row.grid(row=5, column=0, columnspan=3, sticky="ew", padx=20, pady=(8, 2))
         self._darks_row.columnconfigure(2, weight=1)
         self.darks_enabled_var = tk.BooleanVar(value=s.get("darks_enabled", True))
         self._darks_toggle = ToggleSwitch(self._darks_row, self.darks_enabled_var, on_color=C_ACCENT)
@@ -850,7 +906,7 @@ class App:
         self.darks_enabled_var.trace_add("write", self._on_darks_toggle)
 
         self._flats_row = tk.Frame(root, bg=C_BG)
-        self._flats_row.grid(row=8, column=0, columnspan=3, sticky="ew", padx=20, pady=(8, 2))
+        self._flats_row.grid(row=6, column=0, columnspan=3, sticky="ew", padx=20, pady=(8, 2))
         self._flats_row.columnconfigure(2, weight=1)
         self.flats_enabled_var = tk.BooleanVar(value=s.get("flats_enabled", True))
         self._flats_toggle = ToggleSwitch(self._flats_row, self.flats_enabled_var, on_color=C_ACCENT)
@@ -868,7 +924,7 @@ class App:
         self.flats_enabled_var.trace_add("write", self._on_flats_toggle)
 
         self._bias_row = tk.Frame(root, bg=C_BG)
-        self._bias_row.grid(row=9, column=0, columnspan=3, sticky="ew", padx=20, pady=(8, 8))
+        self._bias_row.grid(row=7, column=0, columnspan=3, sticky="ew", padx=20, pady=(8, 8))
         self._bias_row.columnconfigure(2, weight=1)
         self.bias_enabled_var = tk.BooleanVar(value=s.get("bias_enabled", False))
         self._bias_toggle = ToggleSwitch(self._bias_row, self.bias_enabled_var, on_color=C_ACCENT)
@@ -891,9 +947,9 @@ class App:
         self._bias_sub_widgets  = [self._bias_entry,  self._bias_browse]
         self._on_cal_toggle()
 
-        # Master mode: frame type selector + sigma (row 10)
+        # Master mode: frame type selector + sigma (row 8)
         self._master_type_row = tk.Frame(root, bg=C_BG)
-        self._master_type_row.grid(row=10, column=0, columnspan=3,
+        self._master_type_row.grid(row=8, column=0, columnspan=3,
                                    sticky="w", padx=20, pady=(8, 4))
         tk.Label(self._master_type_row, text="Frame Type:",
                  bg=C_BG, fg=C_FG, font=("", 11, "bold"), width=11, anchor="w").pack(side="left")
@@ -942,9 +998,9 @@ class App:
         self.master_bias_var.trace_add("write",
             lambda *_: self._on_master_type_toggle("bias"))
 
-        # Master mode: build button row (row 11)
+        # Master mode: build button row (row 9)
         self._master_btn_row = tk.Frame(root, bg=C_BG)
-        self._master_btn_row.grid(row=11, column=0, columnspan=3, pady=(2, 8))
+        self._master_btn_row.grid(row=9, column=0, columnspan=3, pady=(2, 8))
         self._master_build_btn = tk.Button(
             self._master_btn_row, text="▶  Build Master",
             bg=C_OK, fg=C_BG,
@@ -959,11 +1015,18 @@ class App:
             width=8, state="disabled")
         self._master_stop_btn.pack(side="left", padx=10)
 
+        data_root.columnconfigure(1, weight=1)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CONTROL TAB — Platesolve, Monitor, Batch, Status, Log
+        # ═══════════════════════════════════════════════════════════════════
+        root = control_root
+
         # ── Platesolve ───────────────────────────────────────────────────────
-        self._ps_section_lbl = self._section(root, "Platesolve", row=12)
+        self._ps_section_lbl = self._section(root, "Platesolve", row=0)
 
         self._ps_toggle_row = tk.Frame(root, bg=C_BG)
-        self._ps_toggle_row.grid(row=13, column=0, columnspan=3, sticky="w", padx=12, pady=(6, 2))
+        self._ps_toggle_row.grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(6, 2))
         self.ps_enabled_var = tk.BooleanVar(value=s.get("ps_enabled", True))
         ToggleSwitch(self._ps_toggle_row, self.ps_enabled_var, on_color=C_OK).pack(side="left")
         tk.Label(self._ps_toggle_row, text="Enable Platesolve",
@@ -971,10 +1034,10 @@ class App:
         self.ps_enabled_var.trace_add("write", self._on_ps_toggle)
 
         self._astap_label = tk.Label(root, text="ASTAP Executable Path:", bg=C_BG, fg=C_FG)
-        self._astap_label.grid(row=14, column=0, sticky="nw", padx=10, pady=(8, 4))
+        self._astap_label.grid(row=2, column=0, sticky="nw", padx=10, pady=(8, 4))
         self.astap_var = tk.StringVar(value=s.get("astap_exe", r"C:\Program Files\astap\astap.exe"))
         self._astap_frame = tk.Frame(root, bg=C_BG)
-        self._astap_frame.grid(row=14, column=1, columnspan=2, padx=5, sticky="ew")
+        self._astap_frame.grid(row=2, column=1, columnspan=2, padx=5, sticky="ew")
         self._astap_frame.columnconfigure(0, weight=1)
         self._astap_entry = tk.Entry(self._astap_frame, textvariable=self.astap_var,
                                      bg=C_FIELD, fg=C_FG, insertbackground=C_FG, relief="flat")
@@ -983,13 +1046,34 @@ class App:
                                            bg=C_BTN, fg=C_FG, activebackground=C_BTN_ACT, relief="flat",
                                            command=self._browse_astap)
         self._astap_browse_btn.grid(row=0, column=1, padx=4)
+        self._astap_autodetect_btn = tk.Button(self._astap_frame, text="Auto-detect",
+                                               bg=C_BTN, fg=C_FG, activebackground=C_BTN_ACT, relief="flat",
+                                               command=self._astap_auto_detect)
+        self._astap_autodetect_btn.grid(row=0, column=2, padx=(0, 4))
         tk.Label(self._astap_frame, text="Compatible with ASTAP only",
-                 fg=C_HINT, font=("", 11), bg=C_BG).grid(row=1, column=0, sticky="w")
+                 fg=C_HINT, font=("", 11), bg=C_BG).grid(row=1, column=0, columnspan=2, sticky="w")
+
+        self._astap_status_var = tk.StringVar(value="")
+        self._astap_status_lbl = tk.Label(self._astap_frame, textvariable=self._astap_status_var,
+                                          fg=C_HINT, font=("", 11), bg=C_BG, anchor="w")
+        self._astap_status_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self._astap_download_btn = tk.Button(self._astap_frame, text="Download ASTAP",
+                                             bg=C_BTN, fg=C_FG, activebackground=C_BTN_ACT, relief="flat",
+                                             command=self._astap_download)
+        self._astap_download_btn.grid(row=2, column=2, sticky="w", pady=(2, 0))
+
+        self._astap_catalog_status_var = tk.StringVar(value="")
+        self._astap_catalog_status_lbl = tk.Label(self._astap_frame, textvariable=self._astap_catalog_status_var,
+                                                  fg=C_HINT, font=("", 11), bg=C_BG, anchor="w")
+        self._astap_catalog_status_lbl.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        self.astap_var.trace_add("write", self._on_astap_path_changed)
+        self._on_astap_path_changed()
 
         self._radius_label = tk.Label(root, text="Search Radius (°):", bg=C_BG, fg=C_FG)
-        self._radius_label.grid(row=15, column=0, sticky="w", **pad)
+        self._radius_label.grid(row=3, column=0, sticky="w", **pad)
         self._radius_frame = tk.Frame(root, bg=C_BG)
-        self._radius_frame.grid(row=15, column=1, columnspan=2, padx=5, sticky="w")
+        self._radius_frame.grid(row=3, column=1, columnspan=2, padx=5, sticky="w")
         self.radius_var = tk.StringVar(value=str(s.get("search_radius", 0.5)))
         self._radius_entry = tk.Entry(self._radius_frame, textvariable=self.radius_var, width=8,
                                       bg=C_FIELD, fg=C_FG, insertbackground=C_FG, relief="flat")
@@ -997,20 +1081,34 @@ class App:
         tk.Label(self._radius_frame, text="  (180 = blind solve; reduce when FOV is known)",
                  fg=C_HINT, font=("", 11), bg=C_BG).grid(row=0, column=1, sticky="w")
 
-        self._ps_widgets = [self._astap_entry, self._astap_browse_btn, self._radius_entry]
+        self._blind_retry_row = tk.Frame(self._radius_frame, bg=C_BG)
+        self._blind_retry_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.blind_retry_var = tk.BooleanVar(value=s.get("blind_retry", True))
+        self._blind_retry_toggle = ToggleSwitch(self._blind_retry_row, self.blind_retry_var,
+                                                on_color=C_OK)
+        self._blind_retry_toggle.pack(side="left")
+        tk.Label(self._blind_retry_row, text="Retry with full blind search if directed solve fails",
+                 font=("", 11), bg=C_BG, fg=C_FG).pack(side="left", padx=10)
+        tk.Label(self._blind_retry_row,
+                 text="(recovers from a bad mount/header RA-Dec; adds ~1-2 min per failed frame)",
+                 fg=C_HINT, font=("", 11), bg=C_BG).pack(side="left")
+
+        self._ps_widgets = [self._astap_entry, self._astap_browse_btn,
+                           self._astap_autodetect_btn, self._astap_download_btn,
+                           self._radius_entry]
         self._on_ps_toggle()
 
         # ── Monitor ───────────────────────────────────────────────────────────
-        self._monitor_section_lbl = self._section(root, "Monitor", row=16)
+        self._monitor_section_lbl = self._section(root, "Monitor", row=4)
 
         self._monitor_desc = tk.Frame(root, bg=C_BG)
-        self._monitor_desc.grid(row=17, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 2))
+        self._monitor_desc.grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 2))
         tk.Label(self._monitor_desc,
                  text="Watch the Input Directory for new FITS files and process them automatically as they arrive.",
                  fg=C_HINT, font=("", 11), bg=C_BG).pack(side="left")
 
         self._btn_frame = tk.Frame(root, bg=C_BG)
-        self._btn_frame.grid(row=18, column=0, columnspan=3, pady=8)
+        self._btn_frame.grid(row=6, column=0, columnspan=3, pady=8)
         self.start_btn = tk.Button(
             self._btn_frame, text="▶  Start Monitoring",
             bg=C_OK, fg=C_BG,
@@ -1026,7 +1124,7 @@ class App:
 
         # Schedule start
         self._sched_start_frame = tk.Frame(root, bg=C_BG)
-        self._sched_start_frame.grid(row=19, column=0, columnspan=3, sticky="w", padx=14, pady=(2, 2))
+        self._sched_start_frame.grid(row=7, column=0, columnspan=3, sticky="w", padx=14, pady=(2, 2))
         self.schedule_enabled_var = tk.BooleanVar(value=s.get("schedule_enabled", False))
         self.schedule_time_var    = tk.StringVar(value=s.get("schedule_time", "20:00"))
         self._sched_cb = tk.Checkbutton(self._sched_start_frame, text="Schedule start:",
@@ -1045,7 +1143,7 @@ class App:
 
         # Schedule stop
         self._sched_stop_frame = tk.Frame(root, bg=C_BG)
-        self._sched_stop_frame.grid(row=20, column=0, columnspan=3, sticky="w", padx=14, pady=(2, 2))
+        self._sched_stop_frame.grid(row=8, column=0, columnspan=3, sticky="w", padx=14, pady=(2, 2))
         self.schedule_stop_enabled_var = tk.BooleanVar(value=s.get("schedule_stop_enabled", False))
         self.schedule_stop_time_var    = tk.StringVar(value=s.get("schedule_stop_time", "06:00"))
         self._sched_stop_cb = tk.Checkbutton(self._sched_stop_frame, text="Schedule stop: ",
@@ -1068,16 +1166,16 @@ class App:
         self._on_stop_schedule_toggle()
 
         # ── Process Existing Files ────────────────────────────────────────────
-        self._pef_section_lbl = self._section(root, "Process Existing Files", row=21)
+        self._pef_section_lbl = self._section(root, "Process Existing Files", row=9)
 
         self._batch_desc = tk.Frame(root, bg=C_BG)
-        self._batch_desc.grid(row=22, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 2))
+        self._batch_desc.grid(row=10, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 2))
         tk.Label(self._batch_desc,
                  text="Calibrate and/or platesolve all FITS files currently in the Input Directory.",
                  fg=C_HINT, font=("", 11), bg=C_BG).pack(side="left")
 
         self._batch_btn_frame = tk.Frame(root, bg=C_BG)
-        self._batch_btn_frame.grid(row=23, column=0, columnspan=3, pady=(2, 8))
+        self._batch_btn_frame.grid(row=11, column=0, columnspan=3, pady=(2, 8))
         self.batch_start_btn = tk.Button(
             self._batch_btn_frame, text="▶  Start",
             bg=C_OK, fg=C_BG,
@@ -1092,10 +1190,10 @@ class App:
         self.batch_cancel_btn.pack(side="left", padx=10)
 
         # ── Status ───────────────────────────────────────────────────────────
-        self._section(root, "Status", row=24)
+        self._section(root, "Status", row=12)
 
         status_frame = tk.Frame(root, bg=C_BG)
-        status_frame.grid(row=25, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 2))
+        status_frame.grid(row=13, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 2))
         tk.Label(status_frame, text="Status:", font=("", 8), bg=C_BG, fg=C_FG).pack(side="left")
         self.status_var = tk.StringVar(value="● Idle")
         self.status_lbl = tk.Label(status_frame, textvariable=self.status_var,
@@ -1103,7 +1201,7 @@ class App:
         self.status_lbl.pack(side="left", padx=6)
 
         cal_ctr = tk.Frame(root, bg=C_BG)
-        cal_ctr.grid(row=26, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 1))
+        cal_ctr.grid(row=14, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 1))
         tk.Label(cal_ctr, text="Calibration —", fg=C_FG, bg=C_BG).pack(side="left")
         tk.Label(cal_ctr, text="Calibrated:", bg=C_BG, fg=C_FG).pack(side="left", padx=(8, 0))
         self.cal_done_var = tk.StringVar(value="0 of 0")
@@ -1115,7 +1213,7 @@ class App:
                  font=("", 11, "bold"), fg=C_ERR, bg=C_BG).pack(side="left", padx=4)
 
         self._ps_ctr = tk.Frame(root, bg=C_BG)
-        self._ps_ctr.grid(row=27, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 6))
+        self._ps_ctr.grid(row=15, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 6))
         tk.Label(self._ps_ctr, text="Platesolve —", fg=C_FG, bg=C_BG).pack(side="left")
         tk.Label(self._ps_ctr, text="Platesolved:", bg=C_BG, fg=C_FG).pack(side="left", padx=(8, 0))
         self.solved_var = tk.StringVar(value="0 of 0")
@@ -1128,7 +1226,7 @@ class App:
 
         # ── Errors & Warnings ────────────────────────────────────────────────
         err_header = tk.Frame(root, bg="#3b2222")
-        err_header.grid(row=28, column=0, columnspan=3, sticky="ew", padx=6, pady=(10, 0))
+        err_header.grid(row=16, column=0, columnspan=3, sticky="ew", padx=6, pady=(10, 0))
         tk.Label(err_header, text="  Errors & Warnings",
                  font=("", 11, "bold"), bg="#3b2222", fg=C_FG,
                  anchor="w").pack(side="left", fill="x", expand=True)
@@ -1137,7 +1235,7 @@ class App:
                   command=self._clear_errors).pack(side="right", padx=4, pady=2)
 
         err_frame = tk.Frame(root, bg=C_BG)
-        err_frame.grid(row=29, column=0, columnspan=3, padx=10, pady=(0, 4), sticky="ew")
+        err_frame.grid(row=17, column=0, columnspan=3, padx=10, pady=(0, 4), sticky="ew")
         self.error_widget = tk.Text(err_frame, height=6, width=80,
                                     state="disabled", font=("Courier", 11),
                                     bg=C_BG, fg=C_ERR, insertbackground=C_FG)
@@ -1149,9 +1247,9 @@ class App:
         self.error_widget["yscrollcommand"] = err_sb.set
 
         # ── Activity Log ─────────────────────────────────────────────────────
-        self._section(root, "Activity Log", row=30)
+        self._section(root, "Activity Log", row=18)
         log_frame = tk.Frame(root, bg=C_BG)
-        log_frame.grid(row=31, column=0, columnspan=3, padx=10, pady=4, sticky="nsew")
+        log_frame.grid(row=19, column=0, columnspan=3, padx=10, pady=4, sticky="nsew")
         root.columnconfigure(1, weight=1)
         self.log_widget = tk.Text(log_frame, height=14, width=80,
                                   state="disabled", font=("Courier", 11),
@@ -1171,17 +1269,39 @@ class App:
         if s:
             self.logger.info("Previous settings restored.")
 
-        # ── Copyright ────────────────────────────────────────────────────────
-        tk.Label(root, text="© Art Trail 2026", font=("", 11), fg=C_HINT, bg=C_BG).grid(
-            row=32, column=2, sticky="se", padx=8, pady=(0, 4))
+        # ── Copyright (fixed footer, below tabs) ──────────────────────────────
+        footer = tk.Frame(self.root, bg=C_BG)
+        footer.pack(side="top", fill="x")
+        tk.Label(footer, text="© Art Trail 2026", font=("", 11), fg=C_HINT, bg=C_BG).pack(
+            side="right", padx=8, pady=(0, 4))
 
-        root.columnconfigure(1, weight=1)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Apply initial mode (show/hide correct sections, style buttons)
         self._on_mode_change(self._app_mode)
 
     # ── UI helpers ────────────────────────────────────────────────────────────
+
+    def _make_scrollable(self, parent):
+        """Wrap `parent` in a vertically scrollable canvas. Returns (inner_frame, canvas)."""
+        vsb    = ttk.Scrollbar(parent, orient="vertical")
+        canvas = tk.Canvas(parent, highlightthickness=0, bg=C_BG, yscrollcommand=vsb.set)
+        vsb.config(command=canvas.yview)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        scroll_frame = tk.Frame(canvas, bg=C_BG)
+        cw = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+
+        def _on_frame_resize(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        scroll_frame.bind("<Configure>", _on_frame_resize)
+
+        def _on_canvas_resize(event):
+            canvas.itemconfig(cw, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        return scroll_frame, canvas
 
     def _section(self, parent, title, row) -> tk.Label:
         lbl = tk.Label(parent, text=f"  {title}",
@@ -1387,6 +1507,14 @@ class App:
                        lmargin1=14, lmargin2=14, spacing3=6)
 
         sections = [
+            ("Layout",
+             "Mode toggle (top) — Calibrate Science Frames vs. Create Master Cal Files; "
+             "applies across both tabs below.\n"
+             "Data tab — Directories and Calibration (including Create Master Cal Files controls, "
+             "since it reuses the same Calibration section).\n"
+             "Control tab — Platesolve, Monitor, Process Existing Files, Status, "
+             "Errors & Warnings, and Activity Log.",
+             None),
             ("Mode Toggle",
              "Calibrate Science Frames — the full pipeline: calibrate and/or platesolve your "
              "incoming light frames in real time or as a batch.\n"
@@ -1395,25 +1523,28 @@ class App:
              "frames for use in other software.  It is not required for calibrating science frames "
              "in this app — see Calibration below.",
              None),
-            ("Directories",
+            ("Directories  (Data tab)",
              "Input Directory — the folder containing the incoming FITS files (or source "
              "calibration frames in Create Master mode).\n"
              "Output Directory — where processed files are written (defaults to Input Directory).\n"
              "A 'Calibrated' subfolder is created automatically inside the Output Directory "
              "when calibrating science frames.",
              None),
-            ("Calibration (Science mode)",
+            ("Calibration  (Data tab, Science mode)",
              "Enable Calibration, then choose a calibration source mode:\n"
              "Raw Frames mode (Use master files OFF) — point the Darks, Flats, and/or Bias "
              "toggles at folders containing your raw calibration frames.  FITS Calibrator "
              "builds the master frames automatically at start.\n"
              "Master Files mode (Use master files ON) — point each toggle directly at a "
              "pre-made master FITS file.  No combining is performed; the file is loaded as-is.\n"
+             "Each of the Darks/Flats/Bias Browse buttons remembers that field's own last-used "
+             "folder (or file, in Master Files mode) independently of the other fields.\n"
              "Output file names get a '_CAL' suffix (e.g. image_CAL.fits).\n"
-             "Algorithm: bias subtract → dark subtract (exposure-scaled) → flat correct, "
-             "applied in that order via ccdproc.  Any step whose toggle is off is skipped.",
+             "Algorithm: bias subtract → dark subtract → flat correct, applied in that order "
+             "via ccdproc.  Any step whose toggle is off is skipped.  See the Appendix for exact "
+             "method details.",
              None),
-            ("Create Master Cal Files",
+            ("Create Master Cal Files  (Data tab)",
              "Select the frame type (Darks, Flats, or Bias) and point the Source Frames "
              "Directory at the folder containing the raw calibration frames.\n"
              "Algorithm: median combine all frames with sigma-clipped outlier rejection (via ccdproc).\n"
@@ -1425,20 +1556,57 @@ class App:
              "calibrating science frames.  Use this mode only when you need a saved master "
              "file for use outside this application.",
              None),
-            ("Platesolve (Science mode)",
+            ("Platesolve  (Control tab, Science mode)",
              "Enable Platesolve and set the path to the ASTAP executable.  "
              "ASTAP embeds WCS coordinates directly into the FITS header.\n"
-             "Solved files get a '_WCS' suffix (e.g. image_CAL_WCS.fits).  "
-             "A smaller search radius solves faster when your FOV is known.",
+             "Platesolving writes the WCS solution directly into the file being solved (the "
+             "_CAL.fits file if Calibration is on, otherwise the original input file) via "
+             "ASTAP's -update — no separate copy is created. Check the PLTSOLVD header "
+             "keyword (or the Status counters) to see which files solved.\n"
+             "A smaller search radius solves faster when your FOV is known.\n"
+             "ASTAP's directed search is centered on the RA/DEC already in the FITS header and "
+             "only looks within Search Radius of that point — if the header's RA/DEC is "
+             "significantly wrong (a mount sync/pointing error, not an ASTAP or catalog problem), "
+             "the true field can fall outside that search area and every frame will fail to solve "
+             "no matter how good the image is.\n"
+             "Retry with full blind search if directed solve fails — when enabled (default on), "
+             "a failed directed solve is automatically retried as a full blind (180°, auto-FOV) "
+             "search before giving up. This recovers from exactly that kind of bad header "
+             "RA/DEC, at the cost of roughly 1-2 extra minutes per frame that would otherwise "
+             "have failed. Frames that solve normally are unaffected.\n"
+             "On any successful solve, the FITS header's RA/DEC keywords are overwritten with "
+             "the solved field-center position (ASTAP's own -update only adds WCS keywords "
+             "such as CRVAL/CD/CRPIX — it never corrects RA/DEC itself, so without this a "
+             "stale or wrong RA/DEC would otherwise persist even after a successful solve).\n"
+             "Auto-detect — checks common install locations (e.g. C:\\Program Files\\astap\\) "
+             "and fills the path if found.\n"
+             "Download ASTAP — opens the ASTAP homepage in your browser; FITS Calibrator does "
+             "not download or install ASTAP itself.\n"
+             "Two status lines below the path show, live: whether the executable was found at "
+             "that exact path, and whether star catalog files (H17/H18/H19/W08/D05/D80/G17/M17/V17) "
+             "were found alongside it — ASTAP needs catalog data installed separately from the "
+             "executable in order to actually solve.",
              "Install ASTAP from: https://www.hnsky.org/astap.htm"),
-            ("Monitor (Science mode)",
+            ("Monitor  (Control tab, Science mode)",
              "Watches the directory in real time — every new FITS file that arrives is "
              "automatically calibrated and/or platesolved as it lands.\n"
-             "Use Schedule Start / Stop to set automatic on/off times (HH:MM, 24-hour).",
+             "Use Schedule Start / Stop to set automatic on/off times (HH:MM, 24-hour).  "
+             "The Schedule Stop time can be edited while monitoring is already running.\n"
+             "If the Schedule Start time you enter has already passed for today, a prompt asks "
+             "whether to start monitoring immediately or wait and start at that time tomorrow.",
              None),
-            ("Process Existing Files (Science mode)",
+            ("Process Existing Files  (Control tab, Science mode)",
              "One-shot run: calibrates and/or platesolves every FITS file already present "
              "in the Input Directory, then finishes.  No folder watching.",
+             None),
+            ("Status & Logging  (Control tab)",
+             "Status — shows Idle / Watching / Processing, plus running Calibrated and "
+             "Platesolved counts (succeeded of total attempted) with failure counts.\n"
+             "Errors & Warnings — a filtered view showing only warning- and error-level log "
+             "lines, so problems don't get lost in routine activity; Clear empties this panel "
+             "only (the full log file on disk is untouched).\n"
+             "Activity Log — the complete running log for the current session; also written to "
+             "fits_calibrator_Log.log alongside the app (pruned to the last 3 monitoring sessions).",
              None),
             ("Tips",
              "• Output and Input directories can be the same folder.\n"
@@ -1446,6 +1614,65 @@ class App:
              "automatically from your raw calibration frame folders.\n"
              "• Settings are saved automatically on Start and on close.\n"
              "• Errors and warnings persist in the Errors & Warnings panel until cleared.",
+             None),
+            ("Appendix: Python Packages & Calibration Methods",
+             "FITS Calibrator's calibration math is done by the ccdproc/astropy/numpy stack, not "
+             "custom code — this section documents exactly what each step does.\n\n"
+             "astropy.nddata.CCDData — wraps a pixel array + header + a pixel unit (ADU) so "
+             "ccdproc's calibration functions can operate on it. Two different loading paths are "
+             "used: calibration frames — raw darks/flats/bias when building a master, and "
+             "pre-made master files in Master Files mode — are loaded directly via "
+             "CCDData.read(path, unit=u.adu). The light/science frame is loaded differently: via "
+             "astropy.io.fits.open() first, scanning HDUs for the first one containing 2-D image "
+             "data, then wrapped manually into a CCDData object — this handles light frames whose "
+             "image data isn't in the primary HDU, which CCDData.read() alone would not.\n"
+             "numpy — pixel array math throughout; np.ma.median and np.ma.std (below) are the "
+             "specific statistics used during sigma-clipped master combination.\n\n"
+             "ccdproc.combine (building a master dark/flat/bias, both modes) — combines all input "
+             "frames of one calibration type into a single master, in two stages:\n"
+             "  1. Sigma-clip rejection — each pixel's value is compared, across the stack of "
+             "input frames, against a per-pixel median (sigma_clip_func=np.ma.median, explicitly "
+             "set by FITS Calibrator) using standard deviation as the spread measure "
+             "(sigma_clip_dev_func — left at ccdproc's own default, np.ma.std; FITS Calibrator "
+             "does not override it). Pixels beyond the sigma threshold are masked out as outliers "
+             "(cosmic rays, hot pixels, satellite trails, etc.) before combining.\n"
+             "  2. Final combination (method=\"median\") — the remaining, non-rejected pixel "
+             "values at each position are median-combined into the master frame.\n"
+             "In Science mode's automatic Raw Frames master-building, the sigma-clip threshold is "
+             "fixed at 5σ (not user-adjustable). In standalone Create Master Cal Files mode, the "
+             "sigma-clip threshold is the value you set in the Sigma clip field (default 3.0).\n"
+             "Masters are built independently per calibration type — a master dark is combined "
+             "purely from raw dark frames with no bias correction applied to it first, and "
+             "likewise for the master flat. See the note under subtract_dark below for why this "
+             "matters if you enable both Bias and Darks together.\n\n"
+             "ccdproc.subtract_bias(light, master_bias) — subtracts the master bias frame "
+             "pixel-for-pixel.\n\n"
+             "ccdproc.subtract_dark(light, master_dark, dark_exposure=1s, data_exposure=1s, "
+             "scale=True) — subtracts the master dark. Two things worth knowing:\n"
+             "  • FITS Calibrator currently passes a fixed 1-second value for both dark_exposure "
+             "and data_exposure rather than reading actual exposure times from the FITS headers, "
+             "so the scale=True exposure-ratio scaling always computes to 1.0 in practice — no "
+             "real exposure scaling is applied. Master darks should be captured at the same "
+             "exposure length as the light frames for accurate calibration.\n"
+             "  • Because master-building never bias-subtracts the dark frames first (see "
+             "ccdproc.combine above), the master dark used here still contains its own bias "
+             "signal. If you enable Bias and Darks together, the light frame's bias content is "
+             "effectively removed twice — once explicitly via subtract_bias, and again as part "
+             "of whatever bias signal is embedded in the raw master dark — unless you supply an "
+             "already bias-subtracted dark file yourself via Master Files mode.\n\n"
+             "ccdproc.flat_correct(light, master_flat) — divides by the master flat, which "
+             "ccdproc normalizes internally by the flat's own mean value (no min_value/norm_value "
+             "override is passed), to correct pixel-to-pixel sensitivity and vignetting. Like the "
+             "master dark, the master flat is combined from raw flat frames with no dark or bias "
+             "correction applied to it first.\n\n"
+             "Order of operations — bias → dark → flat, always in that order; any step whose "
+             "toggle is off is skipped entirely (its master is simply never built or loaded).\n\n"
+             "Output — the calibrated array is cast to float32 and written as a single-extension "
+             "FITS file (astropy.io.fits.PrimaryHDU) rather than the multi-HDU CCDData.write() "
+             "default, for compatibility with AstroImageJ and similar tools that expect a plain "
+             "single-HDU float FITS file.\n\n"
+             "watchdog (Observer / FileSystemEventHandler) — not part of the calibration math "
+             "itself, but the package behind the Monitor feature's real-time folder watching.",
              None),
         ]
 
@@ -1456,6 +1683,118 @@ class App:
                 txt.insert("end", f"{note}\n", "note")
 
         txt.config(state="disabled")
+
+    def _show_revision_history(self):
+        win = tk.Toplevel(self.root)
+        win.title("FITS Calibrator — Revision History")
+        win.geometry("680x560")
+        win.resizable(True, True)
+        win.configure(bg=C_BG)
+
+        title = tk.Label(win, text="Revision History",
+                         font=("Segoe UI", 13, "bold"), bg=C_BG2, fg=C_FG,
+                         anchor="w", padx=14, pady=8)
+        title.pack(fill="x")
+
+        txt_frame = tk.Frame(win, bg=C_BG)
+        txt_frame.pack(fill="both", expand=True, padx=14, pady=10)
+
+        txt = tk.Text(txt_frame, wrap="word", font=("Segoe UI", 10),
+                      bg=C_BG2, fg=C_FG, relief="flat",
+                      padx=6, pady=6, state="normal",
+                      insertbackground=C_FG)
+        sb = ttk.Scrollbar(txt_frame, command=txt.yview)
+        txt["yscrollcommand"] = sb.set
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        txt.tag_config("ver", font=("Segoe UI", 11, "bold"), foreground=C_ACCENT,
+                       spacing1=10, spacing3=2)
+        txt.tag_config("body", font=("Segoe UI", 10), foreground=C_FG,
+                       lmargin1=14, lmargin2=14, spacing3=3)
+
+        history = [
+            ("v2.2.2 — 2026-08-29",
+             "• Platesolve now retries a failed directed solve with a full blind (180°, "
+             "auto-FOV) search before giving up, via a new \"Retry with full blind search if "
+             "directed solve fails\" toggle (default on). Fixes a case where every frame in a "
+             "session failed to solve because the FITS header's RA/DEC was significantly wrong "
+             "(mount sync/pointing error), which put the true field outside the directed "
+             "search's radius — ASTAP and the star catalog were never the problem.\n"
+             "• On a successful solve, the FITS header's RA/DEC keywords are now overwritten "
+             "with the solved field-center position. ASTAP's -update only ever added WCS "
+             "keywords (CRVAL/CD/CRPIX/CTYPE) and never corrected RA/DEC itself, so a bad "
+             "header RA/DEC previously survived even a successful solve unchanged.\n"
+             "• Platesolve no longer writes a separate '_WCS.fits' copy — it now solves the "
+             "file in place (the _CAL.fits file if Calibration is on, otherwise the original "
+             "input file directly), so no duplicate files are created on disk."),
+            ("v2.2.1 — 2026-07-26",
+             "• Reorganized into Data / Control tabs; window size reduced ~40% overall\n"
+             "• Added an ASTAP install helper: Auto-detect, Download ASTAP button, and live "
+             "executable-found / catalog-found status lines\n"
+             "• Darks/Flats/Bias Browse dialogs now remember each field's own last-used folder "
+             "or file, instead of sharing whatever was last browsed for Input Directory\n"
+             "• Fixed: Schedule Stop could silently fail to stop monitoring at the set time\n"
+             "• Added a confirmation prompt when the Schedule Start time has already passed "
+             "today, offering to start monitoring now or wait until tomorrow\n"
+             "• Fixed the Calibration section's algorithm note being clipped instead of wrapping "
+             "at narrower window widths\n"
+             "• Added this Help menu (User Guide, Revision History, About)\n"
+             "• Audited and expanded the User Guide, including a new Appendix documenting the "
+             "exact Python packages and ccdproc methods used for calibration"),
+            ("v2.2.0 — 2026-03-28",
+             "• Added a \"Use master files\" toggle — point Darks/Flats/Bias directly at "
+             "pre-made master FITS files instead of raw calibration frame folders\n"
+             "• Reduced font sizes and button padding throughout the GUI (~20% smaller)"),
+            ("v2.1.x",
+             "• Plate-solve integration via ASTAP\n"
+             "• Added Schedule Stop alongside the existing Schedule Start"),
+            ("v2.0.0",
+             "• Full rewrite: Monitor (real-time folder watching) and Process Existing Files "
+             "(one-shot batch) modes"),
+        ]
+
+        for version, body in history:
+            txt.insert("end", f"{version}\n", "ver")
+            txt.insert("end", f"{body}\n", "body")
+
+        txt.config(state="disabled")
+
+    def _show_about(self):
+        win = tk.Toplevel(self.root)
+        win.title("About FITS Calibrator")
+        win.geometry("420x350")
+        win.resizable(False, False)
+        win.configure(bg=C_BG)
+        win.transient(self.root)
+
+        tk.Label(win, text="FITS Calibrator", font=("Segoe UI", 18, "bold"),
+                 bg=C_BG, fg=C_FG).pack(pady=(24, 4))
+        tk.Label(win, text=f"Version {VERSION}", font=("Segoe UI", 11, "italic"),
+                 bg=C_BG, fg=C_HINT).pack()
+        tk.Label(win, text="© Art Trail 2026", font=("Segoe UI", 11, "italic"),
+                 bg=C_BG, fg=C_HINT).pack()
+        tk.Label(win, text="Released under the MIT License", font=("Segoe UI", 11, "italic"),
+                 bg=C_BG, fg=C_HINT).pack()
+
+        link = tk.Label(win, text="github.com/ArtTrail/FITS-Calibrator",
+                        font=("Segoe UI", 11, "italic underline"),
+                        bg=C_BG, fg=C_LINK, cursor="hand2")
+        link.pack(pady=(2, 10))
+        link.bind("<Button-1>", lambda e: webbrowser.open(GITHUB_URL))
+
+        tk.Frame(win, bg=C_SEP, height=1).pack(fill="x", padx=20)
+
+        tk.Label(win, text="Author", font=("Segoe UI", 12, "bold"),
+                 bg=C_BG, fg=C_FG).pack(pady=(14, 2))
+        tk.Label(win, text="Art Trail", font=("Segoe UI", 11),
+                 bg=C_BG, fg=C_FG).pack()
+        tk.Label(win, text="art.trail@icloud.com", font=("Segoe UI", 10, "italic"),
+                 bg=C_BG, fg=C_HINT).pack(pady=(0, 10))
+
+        tk.Label(win, text="Developed entirely with Claude Code (Anthropic).",
+                 font=("Segoe UI", 9, "italic"), bg=C_BG, fg=C_HINT,
+                 wraplength=360, justify="center").pack(padx=16, pady=(0, 14))
 
     # ── Browse helpers ────────────────────────────────────────────────────────
 
@@ -1483,15 +1822,66 @@ class App:
         if f:
             self.astap_var.set(f)
 
+    def _astap_auto_detect(self):
+        for p in ASTAP_CANDIDATE_PATHS:
+            if Path(p).is_file():
+                self.astap_var.set(p)
+                return
+        self._astap_status_var.set("⚠  ASTAP not found in common locations — use Browse or Download")
+        self._astap_status_lbl.config(fg=C_WARN)
+
+    def _astap_download(self):
+        webbrowser.open(ASTAP_DOWNLOAD_URL)
+
+    def _on_astap_path_changed(self, *_):
+        path = self.astap_var.get().strip()
+        if not path:
+            self._astap_status_var.set("")
+            self._astap_catalog_status_var.set("")
+            return
+        if Path(path).is_file():
+            self._astap_status_var.set(f"✓  ASTAP found at {path}")
+            self._astap_status_lbl.config(fg=C_OK)
+        else:
+            self._astap_status_var.set("⚠  Not found at this path — use Browse or Download")
+            self._astap_status_lbl.config(fg=C_WARN)
+
+        cat_msg, cat_ok = self._astap_check_catalog(path)
+        self._astap_catalog_status_var.set(cat_msg)
+        self._astap_catalog_status_lbl.config(fg=C_OK if cat_ok else C_WARN)
+
+    def _astap_check_catalog(self, exe_path: str) -> tuple[str, bool]:
+        d = Path(exe_path).parent
+        if not d.is_dir():
+            return "⚠  Cannot locate ASTAP directory", False
+        try:
+            found = set()
+            for f in d.rglob("*"):
+                if not f.is_file():
+                    continue
+                name_lower = f.name.lower()
+                for prefix in ASTAP_CATALOG_PREFIXES:
+                    if name_lower.startswith(prefix):
+                        found.add(prefix.upper())
+                        break
+        except Exception:
+            return "⚠  Could not read ASTAP directory", False
+        if found:
+            return f"✓  Catalog found: {', '.join(sorted(found))}", True
+        return "⚠  No catalog found — download a catalog (H17, D80, etc.) from hnsky.org", False
+
     def _browse_cal_dir(self, var: tk.StringVar):
+        current = var.get().strip()
         if self.cal_use_master_var.get():
+            init = str(Path(current).parent) if current and Path(current).parent.is_dir() else ""
             f = filedialog.askopenfilename(
-                title="Select master FITS file",
+                title="Select master FITS file", initialdir=init,
                 filetypes=[("FITS files", "*.fits *.fit *.fts"), ("All files", "*.*")])
             if f:
                 var.set(f)
         else:
-            d = filedialog.askdirectory()
+            init = current if current and Path(current).is_dir() else ""
+            d = filedialog.askdirectory(initialdir=init)
             if d:
                 var.set(d)
 
@@ -1512,6 +1902,7 @@ class App:
                 w.config(state=state)
             except tk.TclError:
                 pass
+        self._blind_retry_toggle.set_enabled(self.ps_enabled_var.get())
 
     def _on_cal_toggle(self, *_):
         enabled = self.cal_enabled_var.get()
@@ -1589,6 +1980,7 @@ class App:
             "ps_enabled":            self.ps_enabled_var.get(),
             "astap_exe":             self.astap_var.get(),
             "search_radius":         self._parse_radius(),
+            "blind_retry":           self.blind_retry_var.get(),
             "cal_enabled":           self.cal_enabled_var.get(),
             "cal_use_master":        self.cal_use_master_var.get(),
             "darks_enabled":         self.darks_enabled_var.get(),
@@ -1678,9 +2070,68 @@ class App:
                 messagebox.showerror("Invalid Schedule Time",
                     f"'{time_str}' is not a valid time.\nPlease use HH:MM in 24-hour format.")
                 return
-            self._arm_scheduled_start(target_time)
+            if target_time.date() != datetime.now().date():
+                # _parse_schedule_time only rolls the target to tomorrow when the
+                # given clock time has already passed today — that rollover is the
+                # signal that this happened, so ask instead of scheduling silently.
+                choice = self._confirm_schedule_start_passed(time_str, target_time)
+                if choice == "now":
+                    self._begin_monitoring()
+                elif choice == "tomorrow":
+                    self._arm_scheduled_start(target_time)
+                # else: dialog cancelled/closed — do nothing, Start remains un-armed
+            else:
+                self._arm_scheduled_start(target_time)
         else:
             self._begin_monitoring()
+
+    def _confirm_schedule_start_passed(self, time_str: str, tomorrow_target: datetime) -> str | None:
+        """Modal prompt shown when the Schedule Start time has already passed today.
+        Returns 'now', 'tomorrow', or None if the dialog was dismissed without a choice."""
+        result = {"choice": None}
+
+        win = tk.Toplevel(self.root)
+        win.title("Schedule Start Time Has Passed")
+        win.configure(bg=C_BG)
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        tk.Label(win, text="Schedule Start Time Has Passed",
+                 font=("", 12, "bold"), bg=C_BG2, fg=C_FG, anchor="w",
+                 padx=14, pady=8).pack(fill="x")
+
+        body = tk.Frame(win, bg=C_BG)
+        body.pack(fill="both", expand=True, padx=18, pady=14)
+        tk.Label(body,
+                 text=(f"The Schedule Start time ({time_str}) has already passed for today.\n\n"
+                       "What would you like to do?"),
+                 font=("", 11), bg=C_BG, fg=C_FG, justify="left", wraplength=380).pack(anchor="w")
+
+        btn_frame = tk.Frame(win, bg=C_BG)
+        btn_frame.pack(pady=(0, 14))
+
+        def choose(val):
+            result["choice"] = val
+            win.destroy()
+
+        tk.Button(btn_frame, text="Start Monitoring Now",
+                  bg=C_OK, fg=C_BG, activebackground="#88aa70", activeforeground=C_BG,
+                  font=("", 11, "bold"), relief="flat", padx=10, pady=4,
+                  command=lambda: choose("now")).pack(side="left", padx=8)
+        tk.Button(btn_frame, text=f"Start Tomorrow at {time_str}",
+                  bg=C_BTN, fg=C_FG, activebackground=C_BTN_ACT,
+                  font=("", 11, "bold"), relief="flat", padx=10, pady=4,
+                  command=lambda: choose("tomorrow")).pack(side="left", padx=8)
+
+        win.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (win.winfo_width() // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (win.winfo_height() // 2)
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        win.grab_set()
+        win.wait_window()
+        return result["choice"]
 
     def _begin_monitoring(self):
         watch_dir  = Path(self.watch_var.get().strip())
@@ -1708,6 +2159,7 @@ class App:
             search_radius       = radius,
             logger              = self.logger,
             platesolve_enabled  = self.ps_enabled_var.get(),
+            blind_retry         = self.blind_retry_var.get(),
             cal_enabled         = cal_enabled,
             darks_dir           = darks_dir,
             flats_dir           = flats_dir,
@@ -1820,18 +2272,26 @@ class App:
                          daemon=True).start()
 
     def _schedule_stop_worker(self, cancel_event: threading.Event):
-        last_target = None
+        last_time_str = None
+        target_time = None
         while not cancel_event.is_set():
             time_str = self.schedule_stop_time_var.get().strip()
-            try:
-                target_time = self._parse_schedule_time(time_str)
-                if target_time != last_target:
+            # Only re-derive the target when the user actually edits the time —
+            # NOT every loop iteration. Re-parsing on every tick would let
+            # _parse_schedule_time's "already passed -> roll to tomorrow" logic
+            # push the target a full day forward the instant "now" reaches it,
+            # racing ahead of the remaining<=0 check below and silently
+            # cancelling today's stop.
+            if time_str != last_time_str:
+                try:
+                    new_target = self._parse_schedule_time(time_str)
                     self.logger.info(
-                        f"Scheduled stop {'updated' if last_target else 'set'} to "
-                        f"{target_time.strftime('%H:%M')} on {target_time.strftime('%Y-%m-%d')}")
-                    last_target = target_time
-            except ValueError:
-                target_time = last_target
+                        f"Scheduled stop {'updated' if last_time_str else 'set'} to "
+                        f"{new_target.strftime('%H:%M')} on {new_target.strftime('%Y-%m-%d')}")
+                    target_time = new_target
+                except ValueError:
+                    pass  # keep previous valid target_time until a valid one is typed
+                last_time_str = time_str
             if target_time is None:
                 time.sleep(1)
                 continue
@@ -1908,6 +2368,7 @@ class App:
             search_radius       = radius,
             logger              = self.logger,
             platesolve_enabled  = self.ps_enabled_var.get(),
+            blind_retry         = self.blind_retry_var.get(),
             cal_enabled         = cal_enabled,
             darks_dir           = darks_dir,
             flats_dir           = flats_dir,

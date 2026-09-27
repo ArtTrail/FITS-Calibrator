@@ -22,7 +22,7 @@ A Python/Tkinter desktop application for automated FITS image calibration and pl
   - `astropy`
   - `numpy`
   - `watchdog`
-- [ASTAP](https://www.hnsky.org/astap.htm) (optional, required for plate-solving)
+- [ASTAP](https://www.hnsky.org/astap.htm) (required for plate-solving)
 
 ## Installation
 
@@ -55,13 +55,15 @@ The onedir build will be created in the `dist/` folder.
 ## Pipeline
 
 ```
-Input Dir → Calibrated/image_CAL.fits → Calibrated/image_CAL_WCS.fits
+Input Dir → Calibrated/image_CAL.fits (plate-solved in place, no separate WCS copy)
 ```
 
 ## Version History
 
 | Version | Date       | Notes                                      |
 |---------|------------|--------------------------------------------|
+| 2.2.2   | 2026-08-29 | Platesolve retries a failed directed solve with a full blind (180°, auto-FOV) search before giving up (new toggle, default on) — fixes total solve failure when the FITS header RA/DEC is significantly wrong (mount sync/pointing error), which put the true field outside the directed search radius; on any successful solve, RA/DEC header keywords are now overwritten with the solved field-center position (ASTAP's -update never corrected them itself) |
+| 2.2.1   | 2026-07-26 | Data/Control tabs; window size reduced ~40%; ASTAP install helper (auto-detect, download link, executable + catalog detection); per-field calibration-folder browse memory; fixed Schedule Stop never firing; Schedule Start "time already passed" prompt (start now vs. tomorrow); Enable Calibration text wrapping fix; User Guide audited + Appendix added on calibration packages/methods |
 | 2.2.0   | 2026-03-28 | Added "Use master files" toggle; UI sizing improvements |
 | 2.1.x   | 2026       | Plate-solve integration, schedule stop     |
 | 2.0.0   | 2026       | Full rewrite with Monitor + batch modes    |
